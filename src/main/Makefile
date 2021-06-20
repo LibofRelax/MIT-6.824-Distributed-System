@@ -1,5 +1,4 @@
-TARGETS := mrmaster mrworker mrsequential
-SRC := $(addsuffix .go, $(TARGETS))
+TARGETS = mrmaster mrworker mrsequential
 
 .PHONY: all build
 
@@ -8,4 +7,5 @@ all: build
 build: $(TARGETS)
 
 %: %.go
-	@go build -v $^;
+	@echo ---- building $^ ----
+	@go build $^

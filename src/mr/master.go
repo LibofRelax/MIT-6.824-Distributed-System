@@ -1,37 +1,53 @@
 package mr
 
-import "log"
+import (
+	"log"
+)
 import "net"
 import "os"
 import "net/rpc"
 import "net/http"
 
-
 type Master struct {
-	// Your definitions here.
-
+	pendingMapFiles    []string
+	pendingReduceTasks []int
+	nMap               int
+	nReduce            int
+	runningMapTask     map[string]struct{}
+	runningReduceTask  map[int]struct{}
 }
 
-// Your code here -- RPC handlers for the worker to call.
+//
+// create a Master.
+// main/mrmaster.go calls this function.
+// nReduce is the number of reduce tasks to use.
+//
+func MakeMaster(files []string, nReduce int) *Master {
+	reduceTaskNo := make([]int, 0, nReduce)
+	for i, _ := range reduceTaskNo {
+		reduceTaskNo[i] = i
+	}
 
-//
-// an example RPC handler.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-func (m *Master) Example(args *ExampleArgs, reply *ExampleReply) error {
-	reply.Y = args.X + 1
-	return nil
+	m := Master{
+		pendingMapFiles:    files,
+		pendingReduceTasks: reduceTaskNo,
+		nMap:               len(files),
+		nReduce:            nReduce,
+		runningMapTask:     make(map[string]struct{}),
+		runningReduceTask:  make(map[int]struct{}),
+	}
+
+	m.server()
+	return &m
 }
-
 
 //
 // start a thread that listens for RPCs from worker.go
 //
 func (m *Master) server() {
-	rpc.Register(m)
+	_ = rpc.Register(m)
 	rpc.HandleHTTP()
-	//l, e := net.Listen("tcp", ":1234")
+
 	sockname := masterSock()
 	os.Remove(sockname)
 	l, e := net.Listen("unix", sockname)
@@ -46,25 +62,72 @@ func (m *Master) server() {
 // if the entire job has finished.
 //
 func (m *Master) Done() bool {
-	ret := false
-
-	// Your code here.
-
-
-	return ret
+	return len(m.runningReduceTask) == 0 && len(m.runningMapTask) == 0 &&
+		len(m.pendingReduceTasks) != 0 && len(m.pendingMapFiles) != 0
 }
 
-//
-// create a Master.
-// main/mrmaster.go calls this function.
-// nReduce is the number of reduce tasks to use.
-//
-func MakeMaster(files []string, nReduce int) *Master {
-	m := Master{}
+func (m *Master) AskTask(req *AskTaskReq, rsp *AskTaskRsp) error {
+	if len(m.pendingMapFiles) != 0 {
+		rsp = m.dispatchMap()
+	}
 
-	// Your code here.
+	if len(m.pendingReduceTasks) != 0 {
+		rsp = m.dispatchReduce()
+	}
 
+	rsp = &AskTaskRsp{
+		Type: "DONE",
+	}
+	return nil
+}
 
-	m.server()
-	return &m
+func (m *Master) dispatchMap() *AskTaskRsp {
+	if len(m.pendingMapFiles) == 0 {
+		return &AskTaskRsp{
+			Type: "",
+		}
+	}
+
+	filename := m.pendingMapFiles[0]
+	m.pendingMapFiles = m.pendingMapFiles[1:]
+
+	rsp := &AskTaskRsp{
+		Type:      "MAP",
+		Filename:  filename,
+		MapSeq:    len(m.runningMapTask),
+		ReduceSeq: m.nReduce,
+	}
+
+	m.runningMapTask[filename] = struct{}{}
+	return rsp
+}
+
+func (m *Master) dispatchReduce() *AskTaskRsp {
+	if len(m.pendingReduceTasks) == 0 {
+		return &AskTaskRsp{
+			Type: "DONE",
+		}
+	}
+
+	reduceSeq := m.pendingReduceTasks[0]
+	m.pendingReduceTasks = m.pendingReduceTasks[1:]
+
+	rsp := &AskTaskRsp{
+		Type:      "REDUCE",
+		MapSeq:    m.nMap,
+		ReduceSeq: reduceSeq,
+	}
+
+	m.runningReduceTask[reduceSeq] = struct{}{}
+	return rsp
+}
+
+func (m *Master) MapDone(req *MapDoneReq, rsp *MapDoneRsp) error {
+	delete(m.runningMapTask, req.SrcFilename)
+	return nil
+}
+
+func (m *Master) ReduceDone(req *ReduceDoneReq, rsp *ReduceDoneRsp) error {
+	delete(m.runningReduceTask, req.TaskSeq)
+	return nil
 }

@@ -8,5 +8,6 @@ all: build
 build: $(TARGETS)
 
 %.so: %.go
-	@go build -v -buildmode=plugin $^
+	@echo ---- building $^ ----
+	@go build -buildmode=plugin $^
 
