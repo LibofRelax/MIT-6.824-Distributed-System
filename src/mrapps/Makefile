@@ -7,7 +7,9 @@ all: build
 
 build: $(TARGETS)
 
-%.so: %.go
-	@echo ---- building $^ ----
-	@go build -buildmode=plugin $^
+mrfiles = $(wildcard ../mr/*.go)
+
+%.so: %.go $(mrfiles)
+	@echo ---- building $< ----
+	@go build -buildmode=plugin $<
 

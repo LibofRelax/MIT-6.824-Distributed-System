@@ -1,7 +1,9 @@
 package mr
 
 import (
+	"fmt"
 	"log"
+	"sync"
 )
 import "net"
 import "os"
@@ -9,9 +11,11 @@ import "net/rpc"
 import "net/http"
 
 type Master struct {
+	mutex sync.Mutex
+
 	pendingMapFiles    []string
 	pendingReduceTasks []int
-	nMap               int
+	curMapSeq          int
 	nReduce            int
 	runningMapTask     map[string]struct{}
 	runningReduceTask  map[int]struct{}
@@ -23,7 +27,7 @@ type Master struct {
 // nReduce is the number of reduce tasks to use.
 //
 func MakeMaster(files []string, nReduce int) *Master {
-	reduceTaskNo := make([]int, 0, nReduce)
+	reduceTaskNo := make([]int, nReduce, nReduce)
 	for i, _ := range reduceTaskNo {
 		reduceTaskNo[i] = i
 	}
@@ -31,7 +35,7 @@ func MakeMaster(files []string, nReduce int) *Master {
 	m := Master{
 		pendingMapFiles:    files,
 		pendingReduceTasks: reduceTaskNo,
-		nMap:               len(files),
+		curMapSeq:          0,
 		nReduce:            nReduce,
 		runningMapTask:     make(map[string]struct{}),
 		runningReduceTask:  make(map[int]struct{}),
@@ -63,71 +67,84 @@ func (m *Master) server() {
 //
 func (m *Master) Done() bool {
 	return len(m.runningReduceTask) == 0 && len(m.runningMapTask) == 0 &&
-		len(m.pendingReduceTasks) != 0 && len(m.pendingMapFiles) != 0
+		len(m.pendingReduceTasks) == 0 && len(m.pendingMapFiles) == 0
 }
 
 func (m *Master) AskTask(req *AskTaskReq, rsp *AskTaskRsp) error {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
 	if len(m.pendingMapFiles) != 0 {
-		rsp = m.dispatchMap()
+		fmt.Println("master dispatch MAP task")
+		m.dispatchMap(rsp)
+		return nil
+	}
+	if len(m.runningMapTask) != 0 {
+		rsp.Type = ""
+		return nil
 	}
 
 	if len(m.pendingReduceTasks) != 0 {
-		rsp = m.dispatchReduce()
+		fmt.Println("master dispatch REDUCE task")
+		m.dispatchReduce(rsp)
+		return nil
 	}
 
-	rsp = &AskTaskRsp{
-		Type: "DONE",
-	}
+	rsp.Type = "DONE"
 	return nil
 }
 
-func (m *Master) dispatchMap() *AskTaskRsp {
+func (m *Master) dispatchMap(rsp *AskTaskRsp) {
 	if len(m.pendingMapFiles) == 0 {
-		return &AskTaskRsp{
-			Type: "",
-		}
+		return
 	}
 
 	filename := m.pendingMapFiles[0]
 	m.pendingMapFiles = m.pendingMapFiles[1:]
 
-	rsp := &AskTaskRsp{
-		Type:      "MAP",
-		Filename:  filename,
-		MapSeq:    len(m.runningMapTask),
-		ReduceSeq: m.nReduce,
-	}
+	rsp.Type = "MAP"
+	rsp.Filename = filename
+	rsp.MapSeq = m.curMapSeq
+	rsp.ReduceSeq = m.nReduce
 
+	fmt.Println("dispatch: ", rsp)
+
+	m.curMapSeq++
 	m.runningMapTask[filename] = struct{}{}
-	return rsp
 }
 
-func (m *Master) dispatchReduce() *AskTaskRsp {
+func (m *Master) dispatchReduce(rsp *AskTaskRsp) {
 	if len(m.pendingReduceTasks) == 0 {
-		return &AskTaskRsp{
-			Type: "DONE",
-		}
+		rsp.Type = "DONE"
+		return
 	}
 
 	reduceSeq := m.pendingReduceTasks[0]
 	m.pendingReduceTasks = m.pendingReduceTasks[1:]
 
-	rsp := &AskTaskRsp{
-		Type:      "REDUCE",
-		MapSeq:    m.nMap,
-		ReduceSeq: reduceSeq,
-	}
+	rsp.Type = "REDUCE"
+	rsp.MapSeq = m.curMapSeq
+	rsp.ReduceSeq = reduceSeq
+
+	fmt.Println("dispatch: ", rsp)
 
 	m.runningReduceTask[reduceSeq] = struct{}{}
-	return rsp
 }
 
 func (m *Master) MapDone(req *MapDoneReq, rsp *MapDoneRsp) error {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	fmt.Printf("map %s done\n", req.SrcFilename)
 	delete(m.runningMapTask, req.SrcFilename)
 	return nil
 }
 
 func (m *Master) ReduceDone(req *ReduceDoneReq, rsp *ReduceDoneRsp) error {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+
+	fmt.Printf("reduce %d done\n", req.TaskSeq)
 	delete(m.runningReduceTask, req.TaskSeq)
 	return nil
 }

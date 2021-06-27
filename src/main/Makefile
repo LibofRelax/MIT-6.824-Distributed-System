@@ -6,6 +6,8 @@ all: build
 
 build: $(TARGETS)
 
-%: %.go
-	@echo ---- building $^ ----
-	@go build $^
+mrfiles = $(wildcard ../mr/*.go)
+
+%: %.go $(mrfiles)
+	@echo ---- building $< ----
+	@go build $<

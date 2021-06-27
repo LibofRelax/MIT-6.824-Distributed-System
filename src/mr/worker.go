@@ -37,21 +37,24 @@ func Worker(
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 
-	select {
-	case <-ticker.C:
-		rsp, ok := askTask(&AskTaskReq{})
-		if !ok {
-			return
-		}
+	for {
+		select {
+		case <-ticker.C:
+			rsp, ok := askTask(&AskTaskReq{})
+			if !ok {
+				fmt.Println("worker RPC fail")
+				return
+			}
+			fmt.Println("worker got task: ", rsp)
 
-		switch rsp.Type {
-		case "MAP":
-			handleMap(rsp, mapf)
-		case "REDUCE":
-			handleReduce(rsp, reducef)
-		case "DONE":
-			return
-		default:
+			switch rsp.Type {
+			case "MAP":
+				handleMap(rsp, mapf)
+			case "REDUCE":
+				handleReduce(rsp, reducef)
+			case "DONE":
+				return
+			}
 		}
 	}
 }
@@ -61,7 +64,7 @@ func handleMap(rsp *AskTaskRsp, mapf func(string, string) []KeyValue) {
 
 	content, err := getFileContent(filename)
 	if err != nil {
-		return
+		panic(err)
 	}
 
 	kvs := mapf(filename, content)
@@ -114,7 +117,7 @@ func keyValuesToString(kvs []KeyValue) string {
 }
 
 func writeStringToFile(content string, filename string) error {
-	f, err := os.OpenFile(filename, os.O_WRONLY|os.O_CREATE, 644)
+	f, err := os.OpenFile(filename, os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
 		return err
 	}
@@ -126,7 +129,7 @@ func writeStringToFile(content string, filename string) error {
 func handleReduce(rsp *AskTaskRsp, reducef func(string, []string) string) {
 	kvs, err := aggregateReduceKeyValues(rsp.ReduceSeq, rsp.MapSeq)
 	if err != nil {
-		return
+		panic(err)
 	}
 
 	b := strings.Builder{}
