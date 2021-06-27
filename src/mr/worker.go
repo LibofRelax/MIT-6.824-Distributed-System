@@ -183,6 +183,10 @@ func parseStringToKeyValues(str string) []KeyValue {
 	res := make([]KeyValue, 0, len(lines))
 
 	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+
 		var key, value string
 		_, _ = fmt.Sscanf(line, "%s %s", &key, &value)
 
