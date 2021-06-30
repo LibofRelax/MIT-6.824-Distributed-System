@@ -10,7 +10,7 @@ package main
 // Please do not change this file.
 //
 
-import "../mr"
+import "distrubuted_system/mr"
 import "plugin"
 import "os"
 import "fmt"

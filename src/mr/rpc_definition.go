@@ -19,7 +19,7 @@ func askTask(req *AskTaskReq) (*AskTaskRsp, bool) {
 }
 
 type MapDoneReq struct {
-	SrcFilename string
+	Seq int
 }
 
 type MapDoneRsp struct {
@@ -34,7 +34,7 @@ func mapDone(req *MapDoneReq) (*MapDoneRsp, bool) {
 }
 
 type ReduceDoneReq struct {
-	TaskSeq int
+	Seq int
 }
 
 type ReduceDoneRsp struct {

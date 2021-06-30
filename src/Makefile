@@ -2,7 +2,7 @@
 
 
 NO_CLEAN_FILE_EXT := go txt sh
-NO_CLEAN_FILE := Makefile
+NO_CLEAN_FILE := Makefile go.mod go.sum
 
 
 all:

@@ -7,7 +7,7 @@ package main
 //
 
 import "fmt"
-import "../mr"
+import "distrubuted_system/mr"
 import "plugin"
 import "os"
 import "log"

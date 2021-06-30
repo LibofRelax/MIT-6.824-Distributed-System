@@ -2,6 +2,7 @@ package mr
 
 import (
 	"fmt"
+	"github.com/pkg/errors"
 	"hash/fnv"
 	"io/ioutil"
 	"os"
@@ -45,13 +46,18 @@ func Worker(
 				fmt.Println("worker RPC fail")
 				return
 			}
-			fmt.Println("worker got task: ", rsp)
 
 			switch rsp.Type {
 			case "MAP":
-				handleMap(rsp, mapf)
+				if err := handleMap(rsp, mapf); err != nil {
+					fmt.Println(err)
+					return
+				}
 			case "REDUCE":
-				handleReduce(rsp, reducef)
+				if err := handleReduce(rsp, reducef); err != nil {
+					fmt.Println(err)
+					return
+				}
 			case "DONE":
 				return
 			}
@@ -59,38 +65,44 @@ func Worker(
 	}
 }
 
-func handleMap(rsp *AskTaskRsp, mapf func(string, string) []KeyValue) {
+func handleMap(rsp *AskTaskRsp, mapf func(string, string) []KeyValue) error {
+	fmt.Println("worker handle map:", rsp.MapSeq)
+
 	filename := rsp.Filename
 
 	content, err := getFileContent(filename)
 	if err != nil {
-		panic(err)
+		return errors.Wrap(err, "get file content failed")
 	}
 
 	kvs := mapf(filename, content)
 	kvGroups := splitKeyValuesToReduceGroup(kvs, rsp.ReduceSeq)
 
 	for i, kvGroup := range kvGroups {
-		kvString := keyValuesToString(kvGroup)
+		kvString, err := keyValuesToString(kvGroup)
+		if err != nil {
+			return errors.Wrap(err, "kvs to string failed")
+		}
 
 		outputFilename := fmt.Sprintf("mr-%d-%d", rsp.MapSeq, i)
 		if err := writeStringToFile(kvString, outputFilename); err != nil {
-			return
+			return errors.Wrap(err, "write string to file failed")
 		}
 	}
 
-	mapDone(&MapDoneReq{SrcFilename: filename})
+	mapDone(&MapDoneReq{Seq: rsp.MapSeq})
+	return nil
 }
 
 func getFileContent(filename string) (string, error) {
 	f, err := os.Open(filename)
 	if err != nil {
-		return "", err
+		return "", errors.Wrap(err, "open file failed")
 	}
 
 	content, err := ioutil.ReadAll(f)
 	if err != nil {
-		return "", err
+		return "", errors.Wrap(err, "read file failed")
 	}
 	return string(content), nil
 }
@@ -108,40 +120,62 @@ func splitKeyValuesToReduceGroup(kvs []KeyValue, nReduce int) [][]KeyValue {
 	return res
 }
 
-func keyValuesToString(kvs []KeyValue) string {
+func keyValuesToString(kvs []KeyValue) (string, error) {
 	b := strings.Builder{}
 	for _, kv := range kvs {
-		b.WriteString(fmt.Sprintf("%v %v\n", kv.Key, kv.Value))
+		if _, err := b.WriteString(fmt.Sprintf("%v %v\n", kv.Key, kv.Value)); err != nil {
+			return "", errors.Wrap(err, "write file failed")
+		}
 	}
-	return b.String()
+	return b.String(), nil
 }
 
 func writeStringToFile(content string, filename string) error {
-	f, err := os.OpenFile(filename, os.O_CREATE|os.O_RDWR, 0644)
+	f, err := ioutil.TempFile(".", filename)
 	if err != nil {
-		return err
+		return errors.Wrap(err, "open temp file failed")
+	}
+
+	if err := os.Chmod(f.Name(), 0644); err != nil {
+		return errors.Wrap(err, "chmod failed")
 	}
 
 	_, err = f.WriteString(content)
-	return err
+	if err != nil {
+		return errors.Wrap(err, "write file failed")
+	}
+
+	if _, err = os.Stat(filename); os.IsNotExist(err) {
+		fmt.Println("commit file:", filename)
+		return errors.Wrap(os.Rename(f.Name(), filename), "rename file failed")
+	}
+	fmt.Println("delete file:", f.Name())
+	return errors.Wrap(os.Remove(f.Name()), "remove file failed")
 }
 
-func handleReduce(rsp *AskTaskRsp, reducef func(string, []string) string) {
+func handleReduce(rsp *AskTaskRsp, reducef func(string, []string) string) error {
+	fmt.Println("worker handle reduce:", rsp.ReduceSeq)
+
 	kvs, err := aggregateReduceKeyValues(rsp.ReduceSeq, rsp.MapSeq)
 	if err != nil {
-		panic(err)
+		return errors.Wrap(err, "aggregate kvs failed")
 	}
 
 	b := strings.Builder{}
 	for k, vs := range kvs {
 		res := reducef(k, vs)
-		b.WriteString(fmt.Sprintf("%v %v\n", k, res))
+		if _, err := b.WriteString(fmt.Sprintf("%v %v\n", k, res)); err != nil {
+			return errors.Wrap(err, "write file failed")
+		}
 	}
 
 	outputFilename := fmt.Sprintf("mr-out-%d", rsp.ReduceSeq)
-	writeStringToFile(b.String(), outputFilename)
+	if err := writeStringToFile(b.String(), outputFilename); err != nil {
+		return errors.Wrap(err, "write string to file failed")
+	}
 
-	reduceDone(&ReduceDoneReq{TaskSeq: rsp.ReduceSeq})
+	reduceDone(&ReduceDoneReq{Seq: rsp.ReduceSeq})
+	return nil
 }
 
 func aggregateReduceKeyValues(reduceSeq int, mapCount int) (map[string][]string, error) {
@@ -149,7 +183,7 @@ func aggregateReduceKeyValues(reduceSeq int, mapCount int) (map[string][]string,
 
 	kvs, err := readAllKeyValues(reduceSeq, mapCount)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "read all kvs failed")
 	}
 
 	for _, kv := range kvs {
@@ -169,11 +203,15 @@ func readAllKeyValues(reduceSeq int, mapCount int) ([]KeyValue, error) {
 
 		content, err := getFileContent(filename)
 		if err != nil {
-			return nil, err
+			return nil, errors.Wrap(err, "get file content failed")
 		}
 
 		kvs := parseStringToKeyValues(content)
 		res = append(res, kvs...)
+
+		if err := os.Remove(filename); err != nil {
+			return nil, errors.Wrap(err, "remove file failed")
+		}
 	}
 	return res, nil
 }
