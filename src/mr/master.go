@@ -93,11 +93,12 @@ func (m *Master) timeoutRunningTasks() {
 		for {
 			select {
 			case <-m.ctx.Done():
+				fmt.Println("stop scanning tasks")
 				return
 			default:
 				m.scanRunningMap(expiredMap)
 				m.scanRunningReduce(expiredReduce)
-				time.Sleep(time.Second)
+				time.Sleep(time.Millisecond * 50)
 			}
 		}
 	}
@@ -123,7 +124,7 @@ func (m *Master) scanRunningMap(c chan *MapTask) {
 	defer m.mutex.Unlock()
 
 	for _, task := range m.runningMapTask {
-		if time.Now().Sub(task.StartTime) > time.Second*5 {
+		if time.Now().Sub(task.StartTime) > time.Second*10 {
 			c <- task
 		}
 	}
@@ -144,7 +145,7 @@ func (m *Master) scanRunningReduce(c chan *ReduceTask) {
 	defer m.mutex.Unlock()
 
 	for _, task := range m.runningReduceTask {
-		if time.Now().Sub(task.StartTime) > time.Second*5 {
+		if time.Now().Sub(task.StartTime) > time.Second*10 {
 			c <- task
 		}
 	}
@@ -258,7 +259,7 @@ func (m *Master) MapDone(req *MapDoneReq, rsp *MapDoneRsp) error {
 
 	_, ok := m.runningMapTask[req.Seq]
 	if !ok {
-		fmt.Printf("map %d duplicate done\n", req.Seq)
+		fmt.Printf("map %d already done\n", req.Seq)
 		return nil
 	}
 
@@ -273,7 +274,7 @@ func (m *Master) ReduceDone(req *ReduceDoneReq, rsp *ReduceDoneRsp) error {
 
 	_, ok := m.runningReduceTask[req.Seq]
 	if !ok {
-		fmt.Printf("reduce %d duplicate done\n", req.Seq)
+		fmt.Printf("reduce %d already done\n", req.Seq)
 		return nil
 	}
 

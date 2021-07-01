@@ -174,6 +174,12 @@ func handleReduce(rsp *AskTaskRsp, reducef func(string, []string) string) error 
 		return errors.Wrap(err, "write string to file failed")
 	}
 
+	for _, filename := range getIntermediateFilenames(rsp.ReduceSeq, rsp.MapSeq) {
+		if err := os.Remove(filename); err != nil {
+			return errors.Wrap(err, "remove file failed")
+		}
+	}
+
 	reduceDone(&ReduceDoneReq{Seq: rsp.ReduceSeq})
 	return nil
 }
@@ -198,9 +204,7 @@ func aggregateReduceKeyValues(reduceSeq int, mapCount int) (map[string][]string,
 
 func readAllKeyValues(reduceSeq int, mapCount int) ([]KeyValue, error) {
 	res := make([]KeyValue, 0)
-	for mapSeq := 0; mapSeq < mapCount; mapSeq++ {
-		filename := fmt.Sprintf("mr-%d-%d", mapSeq, reduceSeq)
-
+	for _, filename := range getIntermediateFilenames(reduceSeq, mapCount) {
 		content, err := getFileContent(filename)
 		if err != nil {
 			return nil, errors.Wrap(err, "get file content failed")
@@ -208,12 +212,17 @@ func readAllKeyValues(reduceSeq int, mapCount int) ([]KeyValue, error) {
 
 		kvs := parseStringToKeyValues(content)
 		res = append(res, kvs...)
-
-		if err := os.Remove(filename); err != nil {
-			return nil, errors.Wrap(err, "remove file failed")
-		}
 	}
 	return res, nil
+}
+
+func getIntermediateFilenames(reduceSeq int, mapCount int) []string {
+	res := make([]string, 0, mapCount)
+	for mapSeq := 0; mapSeq < mapCount; mapSeq++ {
+		filename := fmt.Sprintf("mr-%d-%d", mapSeq, reduceSeq)
+		res = append(res, filename)
+	}
+	return res
 }
 
 func parseStringToKeyValues(str string) []KeyValue {
