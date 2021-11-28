@@ -49,15 +49,18 @@ package labrpc
 //   pass svc to srv.AddService()
 //
 
-import "../labgob"
-import "bytes"
-import "reflect"
-import "sync"
-import "log"
-import "strings"
-import "math/rand"
-import "time"
-import "sync/atomic"
+import (
+	"bytes"
+	"log"
+	"math/rand"
+	"reflect"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"distrubuted_system/labgob"
+)
 
 type reqMsg struct {
 	endname  interface{} // name of sending ClientEnd
@@ -187,7 +190,8 @@ func (rn *Network) LongDelays(yes bool) {
 	rn.longDelays = yes
 }
 
-func (rn *Network) readEndnameInfo(endname interface{}) (enabled bool,
+func (rn *Network) readEndnameInfo(endname interface{}) (
+	enabled bool,
 	servername interface{}, server *Server, reliable bool, longreordering bool,
 ) {
 	rn.mu.Lock()
@@ -279,10 +283,12 @@ func (rn *Network) processReq(req reqMsg) {
 			// Russ points out that this timer arrangement will decrease
 			// the number of goroutines, so that the race
 			// detector is less likely to get upset.
-			time.AfterFunc(time.Duration(ms)*time.Millisecond, func() {
-				atomic.AddInt64(&rn.bytes, int64(len(reply.reply)))
-				req.replyCh <- reply
-			})
+			time.AfterFunc(
+				time.Duration(ms)*time.Millisecond, func() {
+					atomic.AddInt64(&rn.bytes, int64(len(reply.reply)))
+					req.replyCh <- reply
+				},
+			)
 		} else {
 			atomic.AddInt64(&rn.bytes, int64(len(reply.reply)))
 			req.replyCh <- reply
@@ -299,9 +305,11 @@ func (rn *Network) processReq(req reqMsg) {
 			// server in fairly rapid succession.
 			ms = (rand.Int() % 100)
 		}
-		time.AfterFunc(time.Duration(ms)*time.Millisecond, func() {
-			req.replyCh <- replyMsg{false, nil}
-		})
+		time.AfterFunc(
+			time.Duration(ms)*time.Millisecond, func() {
+				req.replyCh <- replyMsg{false, nil}
+			},
+		)
 	}
 
 }
@@ -421,8 +429,10 @@ func (rs *Server) dispatch(req reqMsg) replyMsg {
 		for k, _ := range rs.services {
 			choices = append(choices, k)
 		}
-		log.Fatalf("labrpc.Server.dispatch(): unknown service %v in %v.%v; expecting one of %v\n",
-			serviceName, serviceName, methodName, choices)
+		log.Fatalf(
+			"labrpc.Server.dispatch(): unknown service %v in %v.%v; expecting one of %v\n",
+			serviceName, serviceName, methodName, choices,
+		)
 		return replyMsg{false, nil}
 	}
 }
@@ -504,8 +514,10 @@ func (svc *Service) dispatch(methname string, req reqMsg) replyMsg {
 		for k, _ := range svc.methods {
 			choices = append(choices, k)
 		}
-		log.Fatalf("labrpc.Service.dispatch(): unknown method %v in %v; expecting one of %v\n",
-			methname, req.svcMeth, choices)
+		log.Fatalf(
+			"labrpc.Service.dispatch(): unknown method %v in %v; expecting one of %v\n",
+			methname, req.svcMeth, choices,
+		)
 		return replyMsg{false, nil}
 	}
 }
