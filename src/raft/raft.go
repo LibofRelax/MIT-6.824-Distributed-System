@@ -2,11 +2,11 @@ package raft
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
 	"distrubuted_system/labrpc"
-	"distrubuted_system/raft/client"
 )
 
 //
@@ -29,34 +29,22 @@ import (
 type Raft struct {
 	mu sync.Mutex // lock to protect shared access to this peer's state
 
-	persistentState
-	volatileState
-	leaderVolatileState
+	curTerm    int // current term number
+	logEntries []*LogEntry
+	votedIdx   int // who I voted for
 
-	state  raftState
-	stateC chan raftState
+	committedLogIdx   int       // highest log index known to be committed
+	lastAppliedLogIdx int       // highest log index known to be applied to application
+	nextSendLogIdx    []int     // index of log to be sent for each peer
+	matchLogIdx       []int     // highest log index known to be replicated for each peer
+	lastActiveTime    time.Time // last time a heartbeat is sent for leader or rpc received for follower
+
+	state int
 
 	peers []*labrpc.ClientEnd // RPC endpoints of all peers
 	me    int                 // this peer's index into peers[]
 
 	persister *Persister // object to hold this peer's persisted state
-}
-
-type persistentState struct {
-	curTerm    int // current term number
-	logEntries []*LogEntry
-	votedIdx   int // who I voted for, -1 if none
-}
-
-type volatileState struct {
-	committedLogIdx   int // highest log index known to be committed
-	lastAppliedLogIdx int // highest log index known to be applied to application
-}
-
-type leaderVolatileState struct {
-	nextSendLogIdx []int // index of log to be sent for each peer
-	matchLogIdx    []int // highest log index known to be replicated for each peer
-	lastActiveTime time.Time
 }
 
 type LogEntry struct {
@@ -88,8 +76,6 @@ type ApplyMsg struct {
 // for any long-running work.
 func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{
-		state:     follower,
-		stateC:    make(chan raftState, 1),
 		me:        me,
 		peers:     peers,
 		persister: persister,
@@ -98,7 +84,6 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
-	rf.stateC <- rf.state // push in the initial state
 	go rf.run(applyCh)
 
 	return rf
@@ -126,26 +111,19 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 }
 
 func (rf *Raft) Kill() {
-	rf.changeState(killed)
+	rf.changeState(StateKilled)
 }
 
-func (rf *Raft) changeState(state raftState) {
+func (rf *Raft) changeState(state int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.state = state
-	rf.stateC <- state
 }
 
 func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	return rf.curTerm, rf.state == leader
-}
-
-func (rf *Raft) getRaftState() raftState {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	return rf.state
+	return rf.curTerm, rf.state == StateLeader
 }
 
 func (rf *Raft) run(c chan ApplyMsg) {
@@ -154,104 +132,193 @@ func (rf *Raft) run(c chan ApplyMsg) {
 
 	go rf.applyMessageRoutine(ctx, c)
 
+	rf.changeState(StateCandidate)
+	go rf.runCandidate(ctx)
+
+	tick := time.NewTicker(tickDuration)
+	defer tick.Stop()
+
 	for {
 		select {
-		case <-ctx.Done():
-			return
-
-		case state := <-rf.stateC:
-			switch state {
-			case killed:
+		case <-tick.C:
+			if state, _ := rf.GetState(); state == StateKilled {
 				return
-
-			case leader:
-				go rf.runLeader(ctx)
-
-			case follower:
-				go rf.runFollower(ctx)
-
-			case candidate:
-				go rf.runCandidate(ctx)
 			}
 		}
 	}
 }
 
 func (rf *Raft) applyMessageRoutine(ctx context.Context, c chan ApplyMsg) {
+	tick := time.NewTicker(tickDuration)
+	defer tick.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
 
-		case <-time.Tick(time.Second):
-			rf.applyMessage(c)
-		}
-	}
-}
+		case <-tick.C:
+			// It's ok read stale committed index, hence no locking.
+			if rf.committedLogIdx > rf.lastAppliedLogIdx {
+				rf.lastAppliedLogIdx++
 
-func (rf *Raft) applyMessage(c chan ApplyMsg) {
-	committedIdx, appliedIdx := rf.committedLogIdx, rf.lastAppliedLogIdx
-	for committedIdx > appliedIdx {
-		c <- ApplyMsg{
-			CommandValid: true,
-			Command:      rf.logEntries[appliedIdx+1],
-			CommandIndex: appliedIdx + 1,
+				c <- ApplyMsg{
+					CommandValid: true,
+					Command:      rf.logEntries[rf.lastAppliedLogIdx],
+					CommandIndex: rf.lastAppliedLogIdx,
+				}
+			}
 		}
-		rf.lastAppliedLogIdx++
 	}
 }
 
 func (rf *Raft) runLeader(ctx context.Context) {
-	hbCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	go rf.heartbeat(hbCtx)
-
-	// TODO
+	go rf.heartbeat(ctx)
 }
 
 func (rf *Raft) heartbeat(ctx context.Context) {
+	tick := time.NewTicker(heartbeatInterval)
+	defer tick.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
 
-		case <-time.Tick(heartbeatInterval):
+		case <-tick.C:
 			if time.Now().Sub(rf.lastActiveTime) < idleTimeout {
 				continue
 			}
 
-			// TODO send heartbeat
-
+			for _, peer := range rf.peers {
+				go func(p *labrpc.ClientEnd) {
+					_, _ = AppendEntries(
+						ctx, p, &AppendEntriesReq{},
+					)
+				}(peer)
+			}
 		}
 	}
 }
 
 func (rf *Raft) runCandidate(ctx context.Context) {
-	if ok := rf.doElection(); !ok {
-		rf.changeState(follower)
+	var (
+		ok  bool
+		err error
+	)
+
+	for {
+		waitRandomTime(time.Second)
+		ok, err = rf.doElection(ctx)
+		if err == nil {
+			break
+		}
+	}
+
+	if ok {
+		rf.changeState(StateLeader)
+		go rf.runLeader(ctx)
 	} else {
-		rf.changeState(leader)
+		rf.changeState(StateFollower)
+		go rf.runFollower(ctx)
 	}
 }
 
-func (rf *Raft) doElection() bool {
+func (rf *Raft) doElection(ctx context.Context) (bool, error) {
 	rf.curTerm++
 	rf.votedIdx = rf.me
-	waitRandomTime(time.Second)
 
-	// TODO implement election
+	ctx, cancel := context.WithTimeout(ctx, electionTimeout)
+	defer cancel()
 
-	return true
+	req := &RequestVoteReq{}
+	rspC := make(chan *RequestVoteRsp, len(rf.peers))
+
+	for _, peer := range rf.peers {
+		go func(p *labrpc.ClientEnd) {
+			rsp, _ := RequestVote(ctx, p, req)
+			rspC <- rsp
+
+		}(peer)
+	}
+
+	rspCnt := 0
+	gotVote := 0
+
+	for {
+		select {
+		case <-ctx.Done():
+			return false, fmt.Errorf("election timeout")
+
+		case rsp := <-rspC:
+			rspCnt++
+			if rsp != nil && rsp.Grant {
+				gotVote++
+			}
+
+			if rspCnt == len(rf.peers) {
+				return gotVote == majority(len(rf.peers)), nil
+			}
+		}
+	}
 }
 
 func (rf *Raft) runFollower(ctx context.Context) {
+	tick := time.NewTicker(tickDuration)
+	defer tick.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+
+		case <-tick.C:
+			if time.Now().Sub(rf.lastActiveTime) > heartbeatTimeout {
+				rf.changeState(StateCandidate)
+				go rf.runCandidate(ctx)
+				return
+			}
+		}
+	}
 }
 
-func (rf *Raft) AppendEntries(req *client.AppendEntriesReq, rsp *client.AppendEntriesRsp) {
-
+func (rf *Raft) AppendEntries(req *AppendEntriesReq, rsp *AppendEntriesRsp) {
+	rf.lastActiveTime = time.Now()
 }
 
-func (rf *Raft) RequestVote(req *client.RequestVoteReq, rsp *client.RequestVoteRsp) {
+func (rf *Raft) RequestVote(req *RequestVoteReq, rsp *RequestVoteRsp) {
+	// TODO
 
+	// TODO set after granting vote
+	rf.lastActiveTime = time.Now()
+}
+
+func (rf *Raft) persist() {
+	// Your code here (2C).
+	// Example:
+	// w := new(bytes.Buffer)
+	// e := labgob.NewEncoder(w)
+	// e.Encode(rf.xxx)
+	// e.Encode(rf.yyy)
+	// data := w.Bytes()
+	// rf.persister.SaveRaftState(data)
+}
+
+func (rf *Raft) readPersist(data []byte) {
+	if data == nil || len(data) < 1 { // bootstrap without any state?
+		return
+	}
+	// Your code here (2C).
+	// Example:
+	// r := bytes.NewBuffer(data)
+	// d := labgob.NewDecoder(r)
+	// var xxx
+	// var yyy
+	// if d.Decode(&xxx) != nil ||
+	//    d.Decode(&yyy) != nil {
+	//   error...
+	// } else {
+	//   rf.xxx = xxx
+	//   rf.yyy = yyy
+	// }
 }

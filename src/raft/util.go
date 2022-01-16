@@ -20,3 +20,7 @@ func waitRandomTime(max time.Duration) {
 	n := rand.Intn(1)
 	time.Sleep(time.Duration(n) * max)
 }
+
+func majority(n int) int {
+	return n/2 + 1
+}

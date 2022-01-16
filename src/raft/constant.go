@@ -1,30 +1,20 @@
 package raft
 
 import (
-	"fmt"
 	"time"
 )
 
 const (
-	heartbeatInterval    = 500 * time.Millisecond
-	idleTimeout          = 1 * time.Second
-	heartbeatTimeout     = 2 * time.Second
-	electionTimeout      = 5 * time.Second
-	appendEntriesTimeout = 2 * time.Second
-
-	rpcTimeout = 1 * time.Second
+	heartbeatInterval = 500 * time.Millisecond
+	idleTimeout       = 1 * time.Second
+	heartbeatTimeout  = 2 * time.Second
+	electionTimeout   = 5 * time.Second
+	tickDuration      = 10 * time.Millisecond
 )
-
-var (
-	timeoutError = fmt.Errorf("time out")
-	rpcError     = fmt.Errorf("rpc call error")
-)
-
-type raftState int
 
 const (
-	leader raftState = iota + 1
-	follower
-	candidate
-	killed
+	StateLeader int = iota + 1
+	StateFollower
+	StateCandidate
+	StateKilled
 )
