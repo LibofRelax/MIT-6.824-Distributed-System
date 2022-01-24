@@ -1,12 +1,14 @@
 package raft
 
 import (
-	"context"
 	"fmt"
+	"log"
 	"sync"
 	"time"
 
 	"distrubuted_system/labrpc"
+	"distrubuted_system/raft/client"
+	"distrubuted_system/raft/schema"
 )
 
 //
@@ -27,27 +29,26 @@ import (
 //
 
 type Raft struct {
-	mu sync.Mutex // lock to protect shared access to this peer's state
+	mu        sync.Mutex // lock to protect shared access to this peer's state
+	persister *Persister // object to hold this peer's persisted state
 
-	curTerm    int // current term number
-	logEntries []*LogEntry
-	votedIdx   int // who I voted for
+	logEntries []*schema.LogEntry
+
+	curTerm int // current term number
+	role    RaftRole
 
 	committedLogIdx   int       // highest log index known to be committed
 	lastAppliedLogIdx int       // highest log index known to be applied to application
-	nextSendLogIdx    []int     // index of log to be sent for each peer
-	matchLogIdx       []int     // highest log index known to be replicated for each peer
+	nextSendLogIdx    []int     // index of log to be sent for otherPeers
+	matchLogIdx       []int     // highest log index known to be replicated for otherPeers
 	lastActiveTime    time.Time // last time a heartbeat is sent for leader or rpc received for follower
 
-	state int
+	peers      []*labrpc.ClientEnd // RPC endpoints of all peers
+	otherPeers []*labrpc.ClientEnd
+	me         int // this peer's index into peers[]
+	votedIdx   int // who I voted for
 
-	peers []*labrpc.ClientEnd // RPC endpoints of all peers
-	me    int                 // this peer's index into peers[]
-
-	persister *Persister // object to hold this peer's persisted state
-}
-
-type LogEntry struct {
+	convertToFollowerSignal chan struct{}
 }
 
 // as each Raft peer becomes aware that successive log entries are
@@ -74,7 +75,7 @@ type ApplyMsg struct {
 // tester or service expects Raft to send ApplyMsg messages.
 // Make() must return quickly, so it should start goroutines
 // for any long-running work.
-func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan ApplyMsg) *Raft {
+func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan<- ApplyMsg) *Raft {
 	rf := &Raft{
 		me:        me,
 		peers:     peers,
@@ -83,9 +84,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
-	go rf.run(applyCh)
-
+	rf.run(applyCh)
 	return rf
 }
 
@@ -102,195 +101,261 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
 	term, isLeader := rf.GetState()
 
-	// Your code here (2B).
+	if !isLeader {
+		return -1, term, false
+	}
 
-	return index, term, isLeader
+	// TODO append entries
+
+	return len(rf.logEntries) - 1, term, true
 }
 
 func (rf *Raft) Kill() {
-	rf.changeState(StateKilled)
-}
-
-func (rf *Raft) changeState(state int) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	rf.state = state
+	rf.convertToRole(RaftRoleDead)
 }
 
 func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	return rf.curTerm, rf.state == StateLeader
+	return rf.curTerm, rf.role == RaftRoleLeader
 }
 
-func (rf *Raft) run(c chan ApplyMsg) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+func (rf *Raft) convertToRole(role RaftRole) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.role = role
+}
 
-	go rf.applyMessageRoutine(ctx, c)
+func (rf *Raft) signalConvertToFollower() {
+	rf.convertToFollowerSignal <- struct{}{}
+}
 
-	rf.changeState(StateCandidate)
-	go rf.runCandidate(ctx)
+func (rf *Raft) Logf(format string, v ...interface{}) {
+	format = fmt.Sprintf("Me: %d, %s. Role: %s, Term: %d", rf.me, format, rf.role, rf.curTerm)
+	log.Printf(format, v...)
+}
 
-	tick := time.NewTicker(tickDuration)
-	defer tick.Stop()
+func (rf *Raft) run(c chan<- ApplyMsg) {
+	rf.initInternalStates()
+	rf.backgroundApplyMessage(c)
+	rf.runFollower()
+	return
+}
 
-	for {
-		select {
-		case <-tick.C:
-			if state, _ := rf.GetState(); state == StateKilled {
-				return
-			}
+func (rf *Raft) initInternalStates() {
+	rf.votedIdx = -1
+	rf.lastActiveTime = time.Now().Add(-randomDuration(electionMaxWaitTime))
+	rf.matchLogIdx = make([]int, len(rf.peers)-1)
+	rf.nextSendLogIdx = make([]int, len(rf.peers)-1)
+	rf.otherPeers = make([]*labrpc.ClientEnd, 0, len(rf.peers)-1)
+	rf.convertToFollowerSignal = make(chan struct{})
+
+	for i, p := range rf.peers {
+		if i == rf.me {
+			continue
 		}
+		rf.otherPeers = append(rf.otherPeers, p)
 	}
 }
 
-func (rf *Raft) applyMessageRoutine(ctx context.Context, c chan ApplyMsg) {
-	tick := time.NewTicker(tickDuration)
-	defer tick.Stop()
+func (rf *Raft) backgroundApplyMessage(c chan<- ApplyMsg) {
+	go func() {
+		tick := time.NewTicker(tickDuration)
+		defer tick.Stop()
 
-	for {
-		select {
-		case <-ctx.Done():
-			return
+		for range tick.C {
+			if rf.role == RaftRoleDead {
+				break
+			}
 
-		case <-tick.C:
 			// It's ok read stale committed index, hence no locking.
-			if rf.committedLogIdx > rf.lastAppliedLogIdx {
+			for rf.committedLogIdx > rf.lastAppliedLogIdx {
 				rf.lastAppliedLogIdx++
+				logEntry := rf.logEntries[rf.lastAppliedLogIdx]
 
 				c <- ApplyMsg{
-					CommandValid: true,
-					Command:      rf.logEntries[rf.lastAppliedLogIdx],
+					CommandValid: logEntry.Valid,
+					Command:      logEntry.Command,
 					CommandIndex: rf.lastAppliedLogIdx,
 				}
 			}
 		}
-	}
+	}()
 }
 
-func (rf *Raft) runLeader(ctx context.Context) {
-	go rf.heartbeat(ctx)
-}
+func (rf *Raft) runFollower() {
+	rf.convertToRole(RaftRoleFollower)
+	randomTimeoutOffset := randomDuration(electionMaxWaitTime)
 
-func (rf *Raft) heartbeat(ctx context.Context) {
-	tick := time.NewTicker(heartbeatInterval)
-	defer tick.Stop()
+	go func() {
+		tick := time.NewTicker(tickDuration)
+		defer tick.Stop()
 
-	for {
-		select {
-		case <-ctx.Done():
-			return
-
-		case <-tick.C:
-			if time.Now().Sub(rf.lastActiveTime) < idleTimeout {
-				continue
-			}
-
-			for _, peer := range rf.peers {
-				go func(p *labrpc.ClientEnd) {
-					_, _ = AppendEntries(
-						ctx, p, &AppendEntriesReq{},
-					)
-				}(peer)
-			}
-		}
-	}
-}
-
-func (rf *Raft) runCandidate(ctx context.Context) {
-	var (
-		ok  bool
-		err error
-	)
-
-	for {
-		waitRandomTime(time.Second)
-		ok, err = rf.doElection(ctx)
-		if err == nil {
-			break
-		}
-	}
-
-	if ok {
-		rf.changeState(StateLeader)
-		go rf.runLeader(ctx)
-	} else {
-		rf.changeState(StateFollower)
-		go rf.runFollower(ctx)
-	}
-}
-
-func (rf *Raft) doElection(ctx context.Context) (bool, error) {
-	rf.curTerm++
-	rf.votedIdx = rf.me
-
-	ctx, cancel := context.WithTimeout(ctx, electionTimeout)
-	defer cancel()
-
-	req := &RequestVoteReq{}
-	rspC := make(chan *RequestVoteRsp, len(rf.peers))
-
-	for _, peer := range rf.peers {
-		go func(p *labrpc.ClientEnd) {
-			rsp, _ := RequestVote(ctx, p, req)
-			rspC <- rsp
-
-		}(peer)
-	}
-
-	rspCnt := 0
-	gotVote := 0
-
-	for {
-		select {
-		case <-ctx.Done():
-			return false, fmt.Errorf("election timeout")
-
-		case rsp := <-rspC:
-			rspCnt++
-			if rsp != nil && rsp.Grant {
-				gotVote++
-			}
-
-			if rspCnt == len(rf.peers) {
-				return gotVote == majority(len(rf.peers)), nil
-			}
-		}
-	}
-}
-
-func (rf *Raft) runFollower(ctx context.Context) {
-	tick := time.NewTicker(tickDuration)
-	defer tick.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-
-		case <-tick.C:
-			if time.Now().Sub(rf.lastActiveTime) > heartbeatTimeout {
-				rf.changeState(StateCandidate)
-				go rf.runCandidate(ctx)
+		for range tick.C {
+			if time.Now().Sub(rf.lastActiveTime) > electionTimeout+randomTimeoutOffset {
+				rf.runCandidate()
 				return
 			}
 		}
+	}()
+}
+
+func (rf *Raft) runCandidate() {
+	rf.convertToRole(RaftRoleCandidate)
+
+	go func() {
+		for {
+			select {
+			case <-rf.convertToFollowerSignal:
+				rf.runFollower()
+				return
+
+			default:
+				for !rf.doElection() {
+					time.Sleep(randomDuration(electionMaxWaitTime))
+				}
+
+				rf.runLeader()
+				return
+			}
+		}
+	}()
+}
+
+func (rf *Raft) doElection() (done bool) {
+	rf.curTerm++
+	rf.votedIdx = rf.me
+
+	rf.Logf("requesting votes")
+
+	lastLogTerm := 0
+	if l := len(rf.logEntries); l > 0 {
+		lastLogTerm = rf.logEntries[l-1].Term
+	}
+
+	rspC := make(chan *schema.RequestVoteRsp, len(rf.otherPeers))
+
+	for _, peer := range rf.otherPeers {
+		peer := peer
+		go func() {
+			rspC <- client.RequestVote(peer, &schema.RequestVoteReq{
+				Term:         rf.curTerm,
+				CandidateIdx: rf.me,
+				LastLogIdx:   len(rf.logEntries),
+				LastLogTerm:  lastLogTerm,
+			})
+		}()
+	}
+
+	gotVote := 1 // always one vote from self
+
+	for i := 0; i < len(rf.otherPeers); i++ {
+		rsp := <-rspC
+		if rsp == nil {
+			continue
+		}
+
+		if rsp.Grant {
+			gotVote++
+		}
+	}
+
+	rf.Logf("got %d votes", gotVote)
+
+	return gotVote >= majorityOf(len(rf.peers))
+}
+
+func (rf *Raft) runLeader() {
+	rf.convertToRole(RaftRoleLeader)
+
+	rf.sendHeartbeat()
+
+	go func() {
+		heartbeatTick := time.NewTicker(heartbeatInterval)
+		defer heartbeatTick.Stop()
+
+		for {
+			select {
+			case <-rf.convertToFollowerSignal:
+				rf.runFollower()
+				return
+
+			case <-heartbeatTick.C:
+				if rf.role != RaftRoleLeader {
+					break
+				}
+
+				if time.Now().Sub(rf.lastActiveTime) > idleTimeout {
+					rf.sendHeartbeat()
+				}
+
+			default:
+
+			}
+		}
+	}()
+}
+
+func (rf *Raft) sendHeartbeat() {
+	for i, peer := range rf.otherPeers {
+		i, peer := i, peer
+		go func() {
+			rsp := client.AppendEntries(peer, &schema.AppendEntriesReq{
+				Term:      rf.curTerm,
+				LeaderIdx: rf.me,
+			})
+
+			if rsp == nil {
+				rf.Logf("failed to send heartbeat to %d", i)
+			}
+		}()
 	}
 }
 
-func (rf *Raft) AppendEntries(req *AppendEntriesReq, rsp *AppendEntriesRsp) {
-	rf.lastActiveTime = time.Now()
+func (rf *Raft) AppendEntries(req *schema.AppendEntriesReq, rsp *schema.AppendEntriesRsp) {
+	rf.Logf("receive AppendEntriesReq: %+v", req)
+
+	switch rf.role {
+	case RaftRoleCandidate:
+		if req.Term > rf.curTerm {
+			rf.Logf("new leader: %d detected, convert to follower", req.LeaderIdx)
+
+			rf.curTerm = req.Term
+			rf.lastActiveTime = time.Now()
+			rf.signalConvertToFollower()
+		}
+
+	case RaftRoleFollower:
+		rf.curTerm = req.Term
+		rf.lastActiveTime = time.Now()
+
+	case RaftRoleLeader:
+
+	}
 }
 
-func (rf *Raft) RequestVote(req *RequestVoteReq, rsp *RequestVoteRsp) {
-	// TODO
+func (rf *Raft) RequestVote(req *schema.RequestVoteReq, rsp *schema.RequestVoteRsp) {
+	rf.Logf("receive RequestVoteReq: %+v", req)
+	defer func() {
+		rf.Logf("return RequestVoteRsp: %+v", rsp)
+	}()
 
-	// TODO set after granting vote
-	rf.lastActiveTime = time.Now()
+	rsp.Term = rf.curTerm
+
+	if rf.role != RaftRoleFollower {
+		rsp.Grant = false
+		return
+	}
+
+	higherTermThanMe := req.Term > rf.curTerm
+	higherLogIndexThanMe := req.Term == rf.curTerm && req.LastLogIdx > len(rf.logEntries)
+
+	rsp.Grant = higherTermThanMe || higherLogIndexThanMe
+	if rsp.Grant {
+		rf.votedIdx = req.CandidateIdx
+	}
 }
 
 func (rf *Raft) persist() {
